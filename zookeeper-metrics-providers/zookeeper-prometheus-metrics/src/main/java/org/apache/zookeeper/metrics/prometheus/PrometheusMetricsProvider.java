@@ -18,13 +18,18 @@
 
 package org.apache.zookeeper.metrics.prometheus;
 
-import io.prometheus.client.Collector;
-import io.prometheus.client.CollectorRegistry;
-import io.prometheus.client.exporter.MetricsServlet;
-import io.prometheus.client.hotspot.DefaultExports;
+import io.prometheus.metrics.exporter.servlet.javax.PrometheusMetricsServlet;
+import io.prometheus.metrics.instrumentation.jvm.JvmMetrics;
+import io.prometheus.metrics.model.registry.PrometheusRegistry;
+import io.prometheus.metrics.model.snapshots.CounterSnapshot;
+import io.prometheus.metrics.model.snapshots.DataPointSnapshot;
+import io.prometheus.metrics.model.snapshots.GaugeSnapshot;
+import io.prometheus.metrics.model.snapshots.MetricSnapshot;
+import io.prometheus.metrics.model.snapshots.MetricSnapshots;
+import io.prometheus.metrics.model.snapshots.UnknownSnapshot;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.util.Enumeration;
+import java.util.Iterator;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
@@ -39,9 +44,9 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
-import javax.servlet.ServletException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+
 import org.apache.zookeeper.metrics.Counter;
 import org.apache.zookeeper.metrics.CounterSet;
 import org.apache.zookeeper.metrics.Gauge;
@@ -65,7 +70,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * A Metrics Provider implementation based on https://prometheus.io.
+ * A Metrics Provider implementation based on <a href="https://prometheus.io">Prometheus</a>.
  *
  * @since 3.6.0
  */
@@ -101,7 +106,7 @@ public class PrometheusMetricsProvider implements MetricsProvider {
      * libraries every metrics will be expected as a single view.
      * </p>
      */
-    private final CollectorRegistry collectorRegistry = CollectorRegistry.defaultRegistry;
+    private PrometheusRegistry prometheusRegistry = PrometheusRegistry.defaultRegistry;
     private final RateLogger rateLogger = new RateLogger(LOG, 60 * 1000);
     private String host = "0.0.0.0";
     private int httpPort = -1;
@@ -166,16 +171,20 @@ public class PrometheusMetricsProvider implements MetricsProvider {
                 configuration.getProperty(WORKER_SHUTDOWN_TIMEOUT_MS, "1000"));
     }
 
+    public void resetRegistry() {
+        this.prometheusRegistry = new PrometheusRegistry();
+    }
+
     @Override
     public void start() throws MetricsProviderLifeCycleException {
         this.executorOptional = createExecutor();
         try {
-            LOG.info("Starting /metrics {} endpoint at HTTP port: {}, HTTPS port: {}, exportJvmInfo: {}",
+            LOG.info("Starting /metrics endpoint at HTTP port: {}, HTTPS port: {}, exportJvmInfo: {}",
                     httpPort > 0 ? httpPort : "disabled",
                     httpsPort > 0 ? httpsPort : "disabled",
                     exportJvmInfo);
             if (exportJvmInfo) {
-                DefaultExports.initialize();
+                JvmMetrics.builder().register();
             }
             if (httpPort == -1) {
                 server = new Server();
@@ -289,28 +298,49 @@ public class PrometheusMetricsProvider implements MetricsProvider {
     @Override
     public void dump(BiConsumer<String, Object> sink) {
         sampleGauges();
-        Enumeration<Collector.MetricFamilySamples> samplesFamilies = collectorRegistry.metricFamilySamples();
-        while (samplesFamilies.hasMoreElements()) {
-            Collector.MetricFamilySamples samples = samplesFamilies.nextElement();
-            samples.samples.forEach(sample -> {
-                String key = buildKeyForDump(sample);
-                sink.accept(key, sample.value);
-            });
+        MetricSnapshots metricSnapshots = prometheusRegistry.scrape();
+        for (MetricSnapshot snapshot : metricSnapshots) {
+            String key = buildKeyForDump(snapshot);
+            Double value = getValueForDump(snapshot);
+            sink.accept(key, value);
         }
     }
 
-    private static String buildKeyForDump(Collector.MetricFamilySamples.Sample sample) {
+    private static Double getValueForDump(MetricSnapshot snapshot) {
+        DataPointSnapshot dpSnapshot;
+        if (!snapshot.getDataPoints().isEmpty()) {
+            dpSnapshot = snapshot.getDataPoints().get(0);
+        } else return 0.0D;
+
+        if (dpSnapshot instanceof CounterSnapshot.CounterDataPointSnapshot) {
+            return ((CounterSnapshot.CounterDataPointSnapshot) dpSnapshot).getValue();
+        } else if (dpSnapshot instanceof GaugeSnapshot.GaugeDataPointSnapshot) {
+            return ((GaugeSnapshot.GaugeDataPointSnapshot) dpSnapshot).getValue();
+        } else if (dpSnapshot instanceof UnknownSnapshot.UnknownDataPointSnapshot) {
+            return ((UnknownSnapshot.UnknownDataPointSnapshot) dpSnapshot).getValue();
+        }
+
+        return 0.0;
+    }
+
+    private static String buildKeyForDump(MetricSnapshot snapshot) {
         StringBuilder keyBuilder = new StringBuilder();
-        keyBuilder.append(sample.name);
-        if (sample.labelNames.size() > 0) {
+        keyBuilder.append(snapshot.getMetadata().getName());
+
+        DataPointSnapshot dpSnapshot;
+        if (!snapshot.getDataPoints().isEmpty()) {
+            dpSnapshot = snapshot.getDataPoints().get(0);
+        } else return keyBuilder.toString();
+
+        if (!dpSnapshot.getLabels().isEmpty()) {
             keyBuilder.append('{');
-            for (int i = 0; i < sample.labelNames.size(); ++i) {
+            for (int i = 0; i < dpSnapshot.getLabels().size(); ++i) {
                 if (i > 0) {
                     keyBuilder.append(',');
                 }
-                keyBuilder.append(sample.labelNames.get(i));
+                keyBuilder.append(dpSnapshot.getLabels().getName(i));
                 keyBuilder.append("=\"");
-                keyBuilder.append(sample.labelValues.get(i));
+                keyBuilder.append(dpSnapshot.getLabels().getValue(i));
                 keyBuilder.append('"');
             }
             keyBuilder.append('}');
@@ -465,14 +495,15 @@ public class PrometheusMetricsProvider implements MetricsProvider {
 
     private class PrometheusCounter implements Counter {
 
-        private final io.prometheus.client.Counter inner;
+        private final io.prometheus.metrics.core.metrics.Counter inner;
         private final String name;
 
         public PrometheusCounter(String name) {
             this.name = name;
-            this.inner = io.prometheus.client.Counter
-                    .build(name, name)
-                    .register(collectorRegistry);
+            this.inner = io.prometheus.metrics.core.metrics.Counter
+                    .builder()
+                    .name(name)
+                    .register(prometheusRegistry);
         }
 
         @Override
@@ -497,20 +528,21 @@ public class PrometheusMetricsProvider implements MetricsProvider {
 
     private class PrometheusLabelledCounter implements CounterSet {
         private final String name;
-        private final io.prometheus.client.Counter inner;
+        private final io.prometheus.metrics.core.metrics.Counter inner;
 
         public PrometheusLabelledCounter(final String name) {
             this.name = name;
-            this.inner = io.prometheus.client.Counter
-                    .build(name, name)
+            this.inner = io.prometheus.metrics.core.metrics.Counter
+                    .builder()
+                    .name(name)
                     .labelNames(LABELS)
-                    .register(collectorRegistry);
+                    .register(prometheusRegistry);
         }
 
         @Override
         public void add(final String key, final long delta) {
             try {
-                inner.labels(key).inc(delta);
+                inner.labelValues(key).inc(delta);
             } catch (final IllegalArgumentException e) {
                 LOG.error("invalid delta {} for metric {} with key {}", delta, name, key, e);
             }
@@ -519,17 +551,18 @@ public class PrometheusMetricsProvider implements MetricsProvider {
 
     private class PrometheusGaugeWrapper {
 
-        private final io.prometheus.client.Gauge inner;
+        private final io.prometheus.metrics.core.metrics.Gauge inner;
         private final Gauge gauge;
         private final String name;
 
-        public PrometheusGaugeWrapper(String name, Gauge gauge, io.prometheus.client.Gauge prev) {
+        public PrometheusGaugeWrapper(String name, Gauge gauge, io.prometheus.metrics.core.metrics.Gauge prev) {
             this.name = name;
             this.gauge = gauge;
             this.inner = prev != null ? prev
-                    : io.prometheus.client.Gauge
-                    .build(name, name)
-                    .register(collectorRegistry);
+                    : io.prometheus.metrics.core.metrics.Gauge
+                    .builder()
+                    .name(name)
+                    .register(prometheusRegistry);
         }
 
         /**
@@ -542,7 +575,7 @@ public class PrometheusMetricsProvider implements MetricsProvider {
         }
 
         private void unregister() {
-            collectorRegistry.unregister(inner);
+            prometheusRegistry.unregister(inner);
         }
     }
 
@@ -552,17 +585,18 @@ public class PrometheusMetricsProvider implements MetricsProvider {
      */
     private class PrometheusLabelledGaugeWrapper {
         private final GaugeSet gaugeSet;
-        private final io.prometheus.client.Gauge inner;
+        private final io.prometheus.metrics.core.metrics.Gauge inner;
 
         private PrometheusLabelledGaugeWrapper(final String name,
                                                final GaugeSet gaugeSet,
-                                               final io.prometheus.client.Gauge prev) {
+                                               final io.prometheus.metrics.core.metrics.Gauge prev) {
             this.gaugeSet = gaugeSet;
             this.inner = prev != null ? prev :
-                    io.prometheus.client.Gauge
-                            .build(name, name)
+                    io.prometheus.metrics.core.metrics.Gauge
+                            .builder()
+                            .name(name)
                             .labelNames(LABELS)
-                            .register(collectorRegistry);
+                            .register(prometheusRegistry);
         }
 
         /**
@@ -571,33 +605,35 @@ public class PrometheusMetricsProvider implements MetricsProvider {
          */
         private void sample() {
             gaugeSet.values().forEach((key, value) ->
-                this.inner.labels(key).set(value != null ? value.doubleValue() : 0));
+                this.inner.labelValues(key).set(value != null ? value.doubleValue() : 0));
         }
 
         private void unregister() {
-            collectorRegistry.unregister(inner);
+            prometheusRegistry.unregister(inner);
         }
     }
 
     private class PrometheusSummary implements Summary {
 
-        private final io.prometheus.client.Summary inner;
+        private final io.prometheus.metrics.core.metrics.Summary inner;
         private final String name;
 
         public PrometheusSummary(String name, MetricsContext.DetailLevel level) {
             this.name = name;
             if (level == MetricsContext.DetailLevel.ADVANCED) {
-                this.inner = io.prometheus.client.Summary
-                        .build(name, name)
+                this.inner = io.prometheus.metrics.core.metrics.Summary
+                        .builder()
+                        .name(name)
                         .quantile(0.5, 0.05) // Add 50th percentile (= median) with 5% tolerated error
                         .quantile(0.9, 0.01) // Add 90th percentile with 1% tolerated error
                         .quantile(0.99, 0.001) // Add 99th percentile with 0.1% tolerated error
-                        .register(collectorRegistry);
+                        .register(prometheusRegistry);
             } else {
-                this.inner = io.prometheus.client.Summary
-                        .build(name, name)
+                this.inner = io.prometheus.metrics.core.metrics.Summary
+                        .builder()
+                        .name(name)
                         .quantile(0.5, 0.05) // Add 50th percentile (= median) with 5% tolerated error
-                        .register(collectorRegistry);
+                        .register(prometheusRegistry);
             }
         }
 
@@ -617,25 +653,27 @@ public class PrometheusMetricsProvider implements MetricsProvider {
 
     private class PrometheusLabelledSummary implements SummarySet {
 
-        private final io.prometheus.client.Summary inner;
+        private final io.prometheus.metrics.core.metrics.Summary inner;
         private final String name;
 
         public PrometheusLabelledSummary(String name, MetricsContext.DetailLevel level) {
             this.name = name;
             if (level == MetricsContext.DetailLevel.ADVANCED) {
-                this.inner = io.prometheus.client.Summary
-                        .build(name, name)
+                this.inner = io.prometheus.metrics.core.metrics.Summary
+                        .builder()
+                        .name(name)
                         .labelNames(LABELS)
                         .quantile(0.5, 0.05) // Add 50th percentile (= median) with 5% tolerated error
                         .quantile(0.9, 0.01) // Add 90th percentile with 1% tolerated error
                         .quantile(0.99, 0.001) // Add 99th percentile with 0.1% tolerated error
-                        .register(collectorRegistry);
+                        .register(prometheusRegistry);
             } else {
-                this.inner = io.prometheus.client.Summary
-                        .build(name, name)
+                this.inner = io.prometheus.metrics.core.metrics.Summary
+                        .builder()
+                        .name(name)
                         .labelNames(LABELS)
                         .quantile(0.5, 0.05) // Add 50th percentile (= median) with 5% tolerated error
-                        .register(collectorRegistry);
+                        .register(prometheusRegistry);
             }
         }
 
@@ -646,7 +684,7 @@ public class PrometheusMetricsProvider implements MetricsProvider {
 
         private void observe(final String key, final long value) {
             try {
-                inner.labels(key).observe(value);
+                inner.labelValues(key).observe(value);
             } catch (final IllegalArgumentException err) {
                 LOG.error("invalid value {} for metric {} with key {}", value, name, key, err);
             }
@@ -654,10 +692,11 @@ public class PrometheusMetricsProvider implements MetricsProvider {
 
     }
 
-    class MetricsServletImpl extends MetricsServlet {
+    class MetricsServletImpl extends PrometheusMetricsServlet
+    {
 
         @Override
-        protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
             // little trick: update the Gauges before serving data
             // from Prometheus CollectorRegistry
             sampleGauges();

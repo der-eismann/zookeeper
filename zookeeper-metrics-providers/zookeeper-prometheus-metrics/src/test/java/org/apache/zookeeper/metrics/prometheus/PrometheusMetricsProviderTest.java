@@ -71,6 +71,7 @@ public class PrometheusMetricsProviderTest extends PrometheusMetricsTestBase {
     @BeforeEach
     public void setup() throws Exception {
         provider = new PrometheusMetricsProvider();
+        provider.resetRegistry();
         Properties configuration = new Properties();
         configuration.setProperty("numWorkerThreads", "0"); // sync behavior for test
         configuration.setProperty("httpHost", "127.0.0.1"); // local host for test

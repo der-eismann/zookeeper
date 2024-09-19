@@ -48,6 +48,7 @@ public class ExportJvmInfoTest extends PrometheusMetricsTestBase {
             provider.start();
             boolean[] found = {false};
             provider.dump((k, v) -> {
+                System.out.printf("%s: %s%n", k, v);
                 found[0] = found[0] || k.contains("heap");
             });
             assertEquals(exportJvmInfo, found[0]);
