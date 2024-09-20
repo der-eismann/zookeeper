@@ -18,6 +18,7 @@
 
 package org.apache.zookeeper.metrics.prometheus;
 
+import io.prometheus.metrics.model.registry.PrometheusRegistry;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.MatcherAssert.assertThat;
 import java.io.BufferedReader;
@@ -40,7 +41,7 @@ import org.junit.jupiter.api.Test;
  * Tests about Prometheus Metrics Provider. Please note that we are not testing
  * Prometheus but only our integration.
  */
-public class PrometheusHttpsMetricsProviderTest extends PrometheusMetricsTestBase {
+public class PrometheusHttpsMetricsProviderTest {
 
     private PrometheusMetricsProvider provider;
     private String httpHost = "127.0.0.1";
@@ -49,7 +50,7 @@ public class PrometheusHttpsMetricsProviderTest extends PrometheusMetricsTestBas
     private String testDataPath = System.getProperty("test.data.dir", "src/test/resources/data");
 
     public void initializeProviderWithCustomConfig(Properties inputConfiguration) throws Exception {
-        provider = new PrometheusMetricsProvider();
+        provider = new PrometheusMetricsProvider(new PrometheusRegistry());
         Properties configuration = new Properties();
         configuration.setProperty("httpHost", httpHost);
         configuration.setProperty("exportJvmInfo", "false");
@@ -155,7 +156,7 @@ public class PrometheusHttpsMetricsProviderTest extends PrometheusMetricsTestBas
     }
 
     private void validateMetricResponse(String response) throws IOException {
-        assertThat(response, containsString("# TYPE cc counter"));
-        assertThat(response, containsString("cc 10.0"));
+        assertThat(response, containsString("# TYPE cc_total counter"));
+        assertThat(response, containsString("cc_total 10.0"));
     }
 }

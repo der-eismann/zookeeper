@@ -26,7 +26,7 @@ import org.junit.jupiter.api.Test;
  * Tests about Prometheus Metrics Provider. Please note that we are not testing
  * Prometheus but our integration.
  */
-public class ExportJvmInfoTest extends PrometheusMetricsTestBase {
+public class ExportJvmInfoTest {
 
     @Test
     public void exportInfo() throws Exception {
