@@ -24,12 +24,13 @@ import io.prometheus.metrics.model.registry.PrometheusRegistry;
 import io.prometheus.metrics.model.snapshots.CounterSnapshot;
 import io.prometheus.metrics.model.snapshots.DataPointSnapshot;
 import io.prometheus.metrics.model.snapshots.GaugeSnapshot;
+import io.prometheus.metrics.model.snapshots.Label;
 import io.prometheus.metrics.model.snapshots.MetricSnapshot;
-import io.prometheus.metrics.model.snapshots.MetricSnapshots;
+import io.prometheus.metrics.model.snapshots.Quantile;
+import io.prometheus.metrics.model.snapshots.SummarySnapshot;
 import io.prometheus.metrics.model.snapshots.UnknownSnapshot;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.util.Iterator;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
@@ -46,7 +47,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
-
 import org.apache.zookeeper.metrics.Counter;
 import org.apache.zookeeper.metrics.CounterSet;
 import org.apache.zookeeper.metrics.Gauge;
@@ -106,14 +106,14 @@ public class PrometheusMetricsProvider implements MetricsProvider {
      * libraries every metrics will be expected as a single view.
      * </p>
      */
-    private PrometheusRegistry prometheusRegistry = PrometheusRegistry.defaultRegistry;
+    private  PrometheusRegistry prometheusRegistry = PrometheusRegistry.defaultRegistry;
     private final RateLogger rateLogger = new RateLogger(LOG, 60 * 1000);
     private String host = "0.0.0.0";
     private int httpPort = -1;
     private int httpsPort = -1;
     private boolean exportJvmInfo = true;
     private Server server;
-    private final MetricsServletImpl servlet = new MetricsServletImpl();
+    private MetricsServletImpl servlet = new MetricsServletImpl();
     private final Context rootContext = new Context();
     private int numWorkerThreads = 1;
     private int maxQueueSize = 1000000;
@@ -171,9 +171,12 @@ public class PrometheusMetricsProvider implements MetricsProvider {
                 configuration.getProperty(WORKER_SHUTDOWN_TIMEOUT_MS, "1000"));
     }
 
-    public void resetRegistry() {
-        this.prometheusRegistry = new PrometheusRegistry();
+    public PrometheusMetricsProvider(PrometheusRegistry prometheusRegistry) {
+        this.prometheusRegistry = prometheusRegistry;
+        this.servlet = new MetricsServletImpl(prometheusRegistry);
     }
+
+    public PrometheusMetricsProvider() { }
 
     @Override
     public void start() throws MetricsProviderLifeCycleException {
@@ -298,20 +301,30 @@ public class PrometheusMetricsProvider implements MetricsProvider {
     @Override
     public void dump(BiConsumer<String, Object> sink) {
         sampleGauges();
-        MetricSnapshots metricSnapshots = prometheusRegistry.scrape();
-        for (MetricSnapshot snapshot : metricSnapshots) {
-            String key = buildKeyForDump(snapshot);
-            Double value = getValueForDump(snapshot);
-            sink.accept(key, value);
+        for (MetricSnapshot snapshot : prometheusRegistry.scrape()) {
+            for (DataPointSnapshot dpSnapshot : snapshot.getDataPoints()) {
+                if (dpSnapshot instanceof SummarySnapshot.SummaryDataPointSnapshot) {
+                    String key = buildKeyForDump(snapshot.getMetadata().getName()+"_count", dpSnapshot, 0D);
+                    double value = ((SummarySnapshot.SummaryDataPointSnapshot) dpSnapshot).getCount();
+                    sink.accept(key, value);
+                    key = buildKeyForDump(snapshot.getMetadata().getName()+"_sum", dpSnapshot, 0D);
+                    value = ((SummarySnapshot.SummaryDataPointSnapshot) dpSnapshot).getSum();
+                    sink.accept(key, value);
+                    for (Quantile quantile : ((SummarySnapshot.SummaryDataPointSnapshot) dpSnapshot).getQuantiles()) {
+                        key = buildKeyForDump(snapshot.getMetadata().getName(), dpSnapshot, quantile.getQuantile());
+                        value = quantile.getValue();
+                        sink.accept(key, value);
+                    }
+                } else {
+                    String key = buildKeyForDump(snapshot.getMetadata().getName(), dpSnapshot, 0D);
+                    Double value = getValueForDump(dpSnapshot);
+                    sink.accept(key, value);
+                }
+            }
         }
     }
 
-    private static Double getValueForDump(MetricSnapshot snapshot) {
-        DataPointSnapshot dpSnapshot;
-        if (!snapshot.getDataPoints().isEmpty()) {
-            dpSnapshot = snapshot.getDataPoints().get(0);
-        } else return 0.0D;
-
+    private static Double getValueForDump(DataPointSnapshot dpSnapshot) {
         if (dpSnapshot instanceof CounterSnapshot.CounterDataPointSnapshot) {
             return ((CounterSnapshot.CounterDataPointSnapshot) dpSnapshot).getValue();
         } else if (dpSnapshot instanceof GaugeSnapshot.GaugeDataPointSnapshot) {
@@ -323,24 +336,34 @@ public class PrometheusMetricsProvider implements MetricsProvider {
         return 0.0;
     }
 
-    private static String buildKeyForDump(MetricSnapshot snapshot) {
+    private static String buildKeyForDump(String name, DataPointSnapshot dpSnapshot, Double quantile) {
         StringBuilder keyBuilder = new StringBuilder();
-        keyBuilder.append(snapshot.getMetadata().getName());
+        keyBuilder.append(name);
 
-        DataPointSnapshot dpSnapshot;
-        if (!snapshot.getDataPoints().isEmpty()) {
-            dpSnapshot = snapshot.getDataPoints().get(0);
-        } else return keyBuilder.toString();
+        if ((dpSnapshot instanceof CounterSnapshot.CounterDataPointSnapshot) && !name.endsWith("_total")) {
+            keyBuilder.append("_total");
+        }
 
-        if (!dpSnapshot.getLabels().isEmpty()) {
+        if (!dpSnapshot.getLabels().isEmpty() || quantile != 0) {
             keyBuilder.append('{');
-            for (int i = 0; i < dpSnapshot.getLabels().size(); ++i) {
+            int i = 0;
+            for (Label label : dpSnapshot.getLabels()) {
+                Objects.requireNonNull(label.getValue());
                 if (i > 0) {
                     keyBuilder.append(',');
                 }
-                keyBuilder.append(dpSnapshot.getLabels().getName(i));
+                keyBuilder.append(label.getName());
                 keyBuilder.append("=\"");
-                keyBuilder.append(dpSnapshot.getLabels().getValue(i));
+                keyBuilder.append(label.getValue());
+                keyBuilder.append('"');
+                i++;
+            }
+            if (quantile != 0) {
+                if (i > 0) {
+                    keyBuilder.append(',');
+                }
+                keyBuilder.append("quantile=\"");
+                keyBuilder.append(quantile);
                 keyBuilder.append('"');
             }
             keyBuilder.append('}');
@@ -694,6 +717,11 @@ public class PrometheusMetricsProvider implements MetricsProvider {
 
     class MetricsServletImpl extends PrometheusMetricsServlet
     {
+        public MetricsServletImpl(PrometheusRegistry prometheusRegistry)
+        { super(prometheusRegistry); }
+
+        public MetricsServletImpl()
+        { super(); }
 
         @Override
         protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {

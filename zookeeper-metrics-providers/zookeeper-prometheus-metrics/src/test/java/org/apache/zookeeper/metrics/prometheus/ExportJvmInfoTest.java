@@ -26,7 +26,7 @@ import org.junit.jupiter.api.Test;
  * Tests about Prometheus Metrics Provider. Please note that we are not testing
  * Prometheus but our integration.
  */
-public class ExportJvmInfoTest extends PrometheusMetricsTestBase {
+public class ExportJvmInfoTest {
 
     @Test
     public void exportInfo() throws Exception {
@@ -48,7 +48,6 @@ public class ExportJvmInfoTest extends PrometheusMetricsTestBase {
             provider.start();
             boolean[] found = {false};
             provider.dump((k, v) -> {
-                System.out.printf("%s: %s%n", k, v);
                 found[0] = found[0] || k.contains("heap");
             });
             assertEquals(exportJvmInfo, found[0]);
